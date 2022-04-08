@@ -12,6 +12,10 @@ __version__ = "CS224u, Stanford, Spring 2021"
 
 class TorchDeepNeuralClassifierIIT(TorchDeepNeuralClassifier):
     def __init__(self,id_to_coords = None, **base_kwargs):
+        """
+        A trainer for the Interchange Intervention Training (IIT) model, which 
+        implements IIT training.
+        """
         super().__init__(**base_kwargs)
         loss_function= nn.CrossEntropyLoss(reduction="mean")
         self.loss = lambda preds, labels: loss_function(preds[0],labels[:,0]) + loss_function(preds[1],labels[:,1])
@@ -34,27 +38,41 @@ class TorchDeepNeuralClassifierIIT(TorchDeepNeuralClassifier):
 
     def build_dataset(self, base, sources, base_y, IIT_y, coord_ids):
         """
-        Define datasets for the model.
+        Defines the dataset for the IITModel. The inputs are built from
+        stacking the base input, location of intervention, and the input from
+        the given sources. 
 
         Parameters
         ----------
-        X : iterable of length `n_examples`
-           Each element must have the same length.
+        base : list of length n_example
+            The base inputs for the model.
 
-        y: None or iterable of length `n_examples`
+        sources : list of lists, of length n_example
+            A collection of source inputs used to create counterfactuals 
+            during IIT training.
+        
+        base_y : list of length n_example
+            A list of the outputs for the high-level causal graph
+            when computed on the base inputs.
 
-        Attributes
-        ----------
-        input_dim : int
-            Set based on `X.shape[1]` after `X` has been converted to
-            `np.array`.
+        IIT_y : list of length n_example
+            A list of the outputs for the high-level causal graph
+            when computed on the base input, with an intervention by the source 
+            inputs at the location of `coord_ids`.
+        
+        coord_ids : list of length n_example
+            Location of intervention, which maps from a node in the high-level causal structure
+            to parameters in the low-level neural network. 
+            Note: all elements of `coord_ids` must be identical, because we are intervening on a single
+            set of nodes.
 
         Returns
         -------
         torch.utils.data.TensorDataset` Where `y=None`, the dataset will
         yield single tensors `X`. Where `y` is specified, it will yield
         `(X, y)` pairs.
-
+        X and y consist of stacking together (base, coord_ids, sources) and (base_y, IIT_y)
+        respectively.
         """
         base = torch.FloatTensor(np.array(base))
         sources = [torch.FloatTensor(np.array(source)) for source in sources]

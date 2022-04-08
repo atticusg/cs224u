@@ -5,7 +5,45 @@ from utils import randvec
 import copy
 
 class IITModel(torch.nn.Module):
-    def __init__(self, model, layers, id_to_coords,device):
+    def __init__(self, model, layers, id_to_coords, device):
+        """
+        Interchange Intervention Training (IIT) model, which wraps
+        around a neural network (low-level model).
+
+        Parameters
+        ----------
+        model : torch.nn.Module (or subclass)
+            The low-level model that we train using IIT.
+
+        layers : list of torch.nn.Module (or subclasses)
+            The layers of the low-level model, which we will intervene on.
+
+        id_to_coords : dictionary from int to dictionary
+            Alignment between high-level nodes (defined outside of IITModel) to
+            low-level nodes (parameters of the provided model). This is used to map
+            between a representation of a node in our high-level causal structure and the location 
+            of the respective neural network representation. 
+
+        device: str or None
+            Used to set the device on which the PyTorch computations will
+            be done. If `device=None`, this will choose a CUDA device if
+            one is available, else the CPU is used.
+
+        Attributes
+        ----------
+        model : torch.nn.Module (or subclass)
+            The low-level neural network to train.
+
+        layers : list of torch.nn.Module (or subclasses)
+            The layers of the low-level model.
+
+        id_to_coords : dictionary from int to dictionary
+            Mapping between high-level nodes (in the causal abstraction) and
+            low-level nodes (in the neural network).
+
+        device: str or None
+            Device on which PyTorch computations will be done (CPU by default).
+        """
         super().__init__()
         self.model = model
         self.layers = layers
@@ -13,25 +51,64 @@ class IITModel(torch.nn.Module):
         self.device = device
 
     def no_IIT_forward(self, X):
+        """
+        Run the model on a batch of inputs, without applying any interventions. 
+        This is used to run the model on a source input so that we can retrieve its intermediate 
+        computation values (activations of hidden layers).
+        """
         return self.model(X)
 
     def forward(self, X):
+        """
+        Implements forward() function of the torch.nn.Module class.
+        This corresponds to running out IIT model on a forward pass on input X.
+
+        Parameters
+        ----------
+        X : torch.Tensor of shape (batch size, 2 + number of sources, embedding dimension)
+            Input to the forward run of the IIT model. Consists of a single base input (`base`),
+            the location of intervention (`coord_ids`), and a list of sources (`sources`) used to create
+            counterfactual examples by intervening on the model computation of the `base` input at the location of
+            `coord_ids`.
+            Note: all `coord_ids` must be the same, meaning we run the IITModel on only a single type of intervention
+            (that is, a single collection of nodes in the high-level causal structure).
+
+        Returns
+        ----------
+        counterfactual_logits : torch.Tensor of shape (?)
+            The logit predictions on counterfactual examples created by applying
+            interchange intervention on the base input using the provided sources.
+
+
+        base_logits : torch.Tensor of shape (?)
+            The logit prediction on the original base input.
+
+        """
+        # read base, coord_ids, and sources from their stacked representation in X
         base,coord_ids,sources = X[:,0,:].squeeze(1).type(torch.FloatTensor).to(self.device), X[:,1,:].squeeze(1).type(torch.FloatTensor).to(self.device), X[:,2:,:].to(self.device)
         sources = [sources[:,j,:].squeeze(1).type(torch.FloatTensor).to(self.device) for j in range(sources.shape[1])]
+        # assumes that coord_ids are the same, and uses the first to find the location of intervention
         gets = self.id_to_coords[int(coord_ids.flatten()[0])]
+        # applies "gets" in order to read the low-level value from source, and use "sets" in order to
+        # intervene on the base computation using this value
         sets = copy.deepcopy(gets)
         self.activation = dict()
 
         for layer in gets:
             for i, get in enumerate(gets[layer]):
                 handlers = self._gets_sets(gets ={layer: [get]},sets = None)
+                # run model once through on source, so that we can extract intermediate computation values
                 source_logits = self.no_IIT_forward(sources[i])
                 for handler in handlers:
                     handler.remove()
+                # intervene on the model by setting its parameter values for its computation on the base input
+                # on those retrieved from the computation on the source input
                 sets[layer][i]["intervention"] = self.activation[f'{get["layer"]}-{get["start"]}-{get["end"]}']
 
+        # get model output when run on the base input without any interventions
         base_logits = self.no_IIT_forward(base)
         handlers = self._gets_sets(gets = None, sets = sets)
+        # get model output when run on the base input with an intervention from the source computation
         counterfactual_logits = self.no_IIT_forward(base)
         for handler in handlers:
             handler.remove()
