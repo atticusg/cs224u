@@ -28,3 +28,10 @@
 # The Hugging Face transformers library is required:
 #
 # transformers==4.3.3
+
+torch==1.9.0
+torchvision==0.11.1
+transformers==4.3.3
+datasets==2.0.0
+spacy
+gitpython
