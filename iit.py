@@ -1,4 +1,8 @@
+from operator import sub
+from sre_constants import NEGATE
+from tkinter import RIGHT
 import numpy as np
+from sklearn.feature_extraction import DictVectorizer
 import random
 import torch
 from utils import randvec
@@ -123,7 +127,7 @@ class IITModel(torch.nn.Module):
             if sets is not None and layer in sets:
                 layer_sets = sets[layer]
             for get in layer_gets:
-                self.activation[f'{get["layer"]}-{get["start"]}-{get["end"]}'] = output[:,get["start"]: get["end"] ]
+                self.activation[f'{get["layer"]}-{get["start"]}-{get["end"]}'] = output[:,get["start"]: get["end"]]
             for set in layer_sets:
                 output[:,set["start"]: set["end"]] = set["intervention"]
         return hook
@@ -191,6 +195,47 @@ def get_equality_dataset(embed_dim, size):
         X_test = torch.tensor(X_test)
 
         return X_train, X_test, y_train, y_test, test_dataset
+
+def get_IIT_sentiment_dataset(subtree_df, root_model, variable, phi, vectorizer=None, vectorize=True):
+    """
+    variable is 0 or 1, corresponding to LEFT_SUBTREE or RIGHT_SUBTREE
+
+    phi is function to extract features from sentence
+    """
+    LABELS = ['positive', 'neutral', 'negative']
+    dataset = IIT_SentimentAnalysisDataset(subtree_df, root_model, variable)
+    X_base, X_sources, y_base, y_IIT, interventions = dataset.create()
+    # use phi to extract features from sentences in base and source inputs
+    X = [phi(x) for x in X_base] + [phi(x) for source in X_sources for x in source]
+    if vectorize:
+        if vectorizer is None:
+            vectorizer = DictVectorizer(sparse=False)
+            X = vectorizer.fit_transform(X)
+        else:
+            X = vectorizer.transform(X)
+    # reshape X to list of length len(X_base)
+    X = [X[i:i + len(X_base)] for i in range(0, len(X), len(X_base))]
+    # first list is the base, the rest are the sources
+    # should I convert these to tensors? seems that build_dataset takes care of this anyway?
+    X_base = torch.tensor(X[0]) if vectorize else X[0]
+    X_sources = [torch.tensor(source) if vectorize else source for source in X[1:]]
+    y_base = torch.tensor([LABELS.index(label) for label in y_base])
+    y_IIT = torch.tensor([LABELS.index(label) for label in y_IIT])
+    interventions = torch.tensor(interventions)
+    return X_base, X_sources, y_base, y_IIT, interventions, vectorizer
+
+def get_IIT_sentiment_devset(dev_df, variable, phi, vectorizer, vectorize=True):
+    LABELS = ['positive', 'neutral', 'negative']
+    sentences = [phi(x) for x in dev_df['sentence'].values]
+    if vectorize:
+        sentences = torch.tensor(vectorizer.transform(sentences))
+    labels = torch.tensor([LABELS.index(x) for x in dev_df['label'].values])
+    # can I make my sources and IIT labels empty??
+    # what if I don't have a way to measure IIT labels for the test set?
+    sources = [sentences]
+    y_IIT = labels
+    interventions = torch.tensor([variable] * len(dev_df))
+    return sentences, sources, labels, y_IIT, interventions
 
 
 class EqualityDataset:
@@ -292,7 +337,6 @@ class EqualityDataset:
             rep = (vec1, vec2)
             data.append((rep, self.NEG_LABEL))
         return data
-
 
 class PremackDataset:
 
@@ -476,7 +520,6 @@ class PremackDataset:
         assert not np.array_equal(vec1, vec2)
         return (vec1, vec2)
 
-
 class PremackDatasetLeafFlattened(PremackDataset):
     def __init__(self, embed_dim=50, n_pos=500, n_neg=500):
         super().__init__(
@@ -496,7 +539,59 @@ class IIT_PremackDataset:
 
     def __init__(self, variable, embed_dim=50, n_pos=500, n_neg=500,
                  flatten_root=True, flatten_leaves=True, intermediate=False):
+        """Creates IIT Premack datasets. Conceptually, the instances are pairs of inputs,
+        base and source, a label for the base, a label for the base after an intervention
+        from source, and the location of the intervention. For example:
 
+        (((a, b), (c, d)), ((e, e), (f, f)), POS_LABEL, NEG_LABEL, V1)
+
+
+        . With `flatten_leaves=True` and `flatten_root=False`, this becomes
+
+        ((a;b, c;d), (e;e, f;f), POS_LABEL, NEG_LABEL, V1)
+
+        and with `flatten_root=True`, this becomes
+
+        (a;b;c;d, e;e;f;f, POS_LABEL, NEG_LABEL, V1)
+
+        and `flatten_root=True` means that `flatten_leaves=True`, since
+        we can't flatten the root without flattening the leaves.
+
+        Parameters
+        ----------
+        embed_dim : int
+            Sets the dimensionality of the individual component vectors.
+        n_pos : int
+        n_neg : int
+        flatten_root : bool
+        flatten_leaves : bool
+
+        Usage
+        -----
+        dataset = EqualityDataset()
+        X_base, X_sources, y_base, y_IIT, interventions = dataset.create()
+
+        Attributes
+        ----------
+        embed_dim : int
+        n_pos : int
+        n_neg : int
+        flatten_root : bool
+        flatten_leaves : bool
+        n_same_same : n_pos / 2
+        n_diff_diff : n_pos / 2
+        n_same_diff : n_neg / 2
+        n_diff_same : n_neg / 2
+
+        Raises
+        ------
+        ValueError
+            If `n_pos` or `n_neg` is not even, since this means we
+            can't get an even distribtion of the two sub-types of
+            each of those classes while also staying faithful to
+            user's expected number of examples for each class.
+
+        """
         self.variable = variable
         self.embed_dim = embed_dim
         self.n_pos = n_pos
@@ -787,3 +882,107 @@ class IIT_PremackDatasetBoth:
         vec2 = randvec(self.embed_dim)
         assert not np.array_equal(vec1, vec2)
         return (vec1, vec2)
+
+class IIT_SentimentAnalysisDataset:
+    """
+    Create data as follows:
+
+    (base sentence, source sentence, label of base, label of base intervened by source, location of intervention)
+
+    where location of intervention is either LEFT_SUBTREE or RIGHT_SUBTREE, and
+    label is either POSITIVE, NEUTRAL, or NEGATIVE.
+    """
+
+    LEFT_SUBTREE = 0
+    RIGHT_SUBTREE = 1
+    POSITIVE = 0
+    NEUTRAL = 1
+    NEGATIVE = 2
+    LABELS = ['positive', 'neutral', 'negative']
+
+    def one_hot(self, label):
+        return np.eye(len(self.LABELS))[self.LABELS.index(label)]
+
+    def __init__(self, subtree_df, root_model, variable) -> None:
+        """
+        subtree df has rows that give values for:
+        (sentence, label of sentence, left tree, label of left tree, right tree, label of right tree)
+
+        root_model is a function mapping from (left label, right label) --> full sentence label. 
+        Ideally this is a simple model (e.g. LogisticRegression)
+
+        variable is either LEFT_SUBTREE or RIGHT_SUBTREE
+        """
+        self.subtree_df = subtree_df
+        self.root_model = root_model
+        self.variable = variable
+
+    def create_take_two(self):
+        def intervene(base, source, location):
+            interventions_indices = ['left_label', 'right_label']
+            intervention_input = [0, 0] # set up two slots for values
+            intervention_input[location] = self.one_hot(source[interventions_indices[location]])
+            intervention_input[1 - location] = self.one_hot(base[interventions_indices[1 - location]])
+            return np.concatenate(intervention_input)
+        
+        n = len(self.subtree_df)
+
+        # data = [(self.subtree_df.iloc[b].sentence, 
+        #          self.subtree_df.iloc[s].sentence, 
+        #          self.subtree_df.iloc[b].sentence_label, 
+        #          self.root_model.predict(intervene(self.subtree_df.iloc[b], self.subtree_df.iloc[s], self.variable))[0],
+        #          self.variable) for b in range(n) for s in range(n)]
+        base = [self.subtree_df.iloc[b].sentence for b in range(n) for _ in range(n)]
+        source = [self.subtree_df.iloc[s].sentence for _ in range(n) for s in range(n)]
+        y = [self.subtree_df.iloc[b].sentence_label for b in range(n) for _ in range(n)]
+        IIT_y = self.root_model.predict([intervene(self.subtree_df.iloc[b], self.subtree_df.iloc[s], self.variable) for b in range(n) for s in range(n)])
+        interventions = [self.variable] * (n * n)
+        self.counts = Counter(zip(y, [self.subtree_df.iloc[s].sentence_label for _ in range(n) for s in range(n)]))
+        print(self.counts)
+        self.data = list(zip(base, source, y, IIT_y, interventions))
+        # should I shuffle my data?
+        random.shuffle(self.data)
+        # why are we making a copy?
+        data = self.data.copy()
+        base, source, y, IIT_y, interventions = zip(*data)
+        self.base = np.array(base)
+        self.source = np.array(source)
+        self.y = np.array(y)
+        self.IIT_y = np.array(IIT_y)
+        self.interventions = np.array(interventions)
+        self.sources = [source] # feels like the same thing 
+        return self.base, self.sources, self.y, self.IIT_y, self.interventions
+
+    def create(self):
+        self.counts = {}
+        self.data = []
+        for b in range(len(self.subtree_df)):
+            for s in range(len(self.subtree_df)):
+                base = self.subtree_df.iloc[b]
+                source = self.subtree_df.iloc[s]
+                base_label = base['sentence_label']
+                # extract subtree labels for root model evaluation
+                base_input = [base['left_label'], base['right_label']]
+                source_input = [source['left_label'], source['right_label']]
+                # intervene on base input with the source input at the intervention location
+                base_input[self.variable] = source_input[self.variable]
+                # run model to compute root value from leaves
+                model_input = [np.concatenate([self.one_hot(label) for label in base_input])]
+                iit_label = self.root_model.predict(model_input)[0]
+                # BE SURE TO COUNT +, -, and neutrals!!!
+                self.data.append((base.sentence, source.sentence, 
+                                 base_label, iit_label, self.variable))
+                self.counts[(base_label, iit_label)] = self.counts.get((base_label, iit_label), 0) + 1
+        # should I shuffle my data?
+        random.shuffle(self.data)
+        # why are we making a copy?
+        data = self.data.copy()
+        base, source, y, IIT_y, interventions = zip(*data)
+        self.base = np.array(base)
+        self.source = np.array(source)
+        self.y = np.array(y)
+        self.IIT_y = np.array(IIT_y)
+        self.interventions = np.array(interventions)
+        self.sources = [source] # feels like the same thing 
+        print(self.counts)
+        return self.base, self.sources, self.y, self.IIT_y, self.interventions
